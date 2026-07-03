@@ -76,9 +76,20 @@ These the implementing agent must resolve. Each has a recommendation.
    byte log with an index of TLS record boundaries* — `sent` and `recv` as
    contiguous byte vectors plus `Vec<RecordMeta{ offset, len, seq,
    content_type }>`. Byte ranges (`RangeSet<usize>`) address into the
-   contiguous view; record metadata supports tag/keystream work. This is the
-   one representation both commitments (byte ranges) and the record layer
-   (per-record) can share.
+   contiguous view; record metadata supports tag/keystream work.
+
+   **The transcript coordinate model (normative).** To keep every consumer
+   on the same byte-offset model, the following is a definition, not a
+   suggestion. An offset is a 0-based index into the concatenated
+   **application-data plaintext stream of one direction** (record headers,
+   handshake, and alert bytes are excluded from the coordinate space).
+   Ranges are half-open `[start, end)`. Because AES-CTR is
+   length-preserving, the *same* offset addresses the corresponding
+   ciphertext byte, via the record index (`plaintext offset ↔ (record seq,
+   offset-in-record)`). Every range in this plan — commitment spans (M5),
+   redaction/reveal boundaries (M1, M6), per-record keystream and tag work
+   (M4), and the future binding proofs of §11 — uses these coordinates and
+   no others.
 
 ---
 
@@ -91,7 +102,7 @@ output is a named **deferral**, not a manufactured defense.
 | Actor / property | Capability | What stops it in v0 | Milestone | Deferred to malicious mode |
 |---|---|---|---|---|
 | Semi-honest-but-curious prover | Follows protocol, tries to learn verifier secrets or later misreport | Verifier holds no plaintext-relevant secret the prover shouldn't derive; keys are additively shared, prover only ever recombines its own outputs | M3–M4 | Forgery/deviation defenses (below) |
-| Honest verifier (privacy) | Follows protocol, must not learn redacted bytes | Plaintext stays private to prover in the record layer (ciphertext decoded to both, plaintext is prover's private input); commitments are hiding (salted hashes); only revealed ranges opened | M4–M6 | — (honest-verifier privacy is the v0 target) |
+| Honest-**but-curious** verifier (privacy) | Follows protocol, but inspects everything it legitimately receives, trying to learn redacted bytes | **Can't-learn, not won't-look**: the prover's keystream share acts as a one-time pad on plaintext in the record layer; commitments are hiding (salted hashes); disclosure reveals keystream bytes only at revealed offsets (M6); the verifier never reconstructs a full write key | M4–M6 | — (honest-but-curious privacy is the v0 target; see the per-phase table below) |
 | Network adversary | Observe, drop, reorder, inject on prover↔verifier and client↔server links | TLS 1.2 record MAC (AES-GCM tag) rejects tampering/injection on the server link; framed, session-tagged, sequence-checked prover↔verifier channel over an authenticated transport (TLS to verifier); TCP ordering | M3–M4 | Adversarial-prover-controlled reordering of the *proof* transcript |
 | **Malicious prover / colluding prover+verifier** | Deviate from protocol, lie about inputs, equivocate | **OUT OF SCOPE.** Semi-honest assumption excludes it | — | Entire §11 hardening set |
 
@@ -111,6 +122,30 @@ Per integrity-style property — **defend or defer**:
 The "defer" rows are the expected, correct answers. Manufacturing v0
 defenses against attacks the semi-honest assumption already excludes would be
 wasted effort and is explicitly not wanted.
+
+### Which "honest" the verifier is, per phase
+
+"Honest verifier" conflates **honest-for-correctness** (follows the
+protocol) with **honest-for-privacy** (doesn't exploit what it sees). v0
+assumes the first everywhere; the second it must not need: redaction has to
+hold against an honest-but-*curious* verifier — **can't-learn**, or it is
+not privacy at all. Per phase:
+
+| Phase | Correctness assumption | Privacy against a curious verifier (mechanism) |
+|---|---|---|
+| Setup | Follows allocation protocol | Nothing secret exchanged; sizes are public by design. |
+| Handshake | Supplies a well-formed ephemeral share; runs PRF 2PC honestly | Can't-learn: the verifier's PMS/key shares are uniformly random alone; the prover's shares are never sent. |
+| Record layer (sent) | Co-computes keystream honestly | Can't-learn: the verifier sees `pt ⊕ ks_P` (prover's keystream share is a one-time pad) and its own `ks_V`; without `ks_P` the plaintext is information-theoretically hidden. |
+| Record layer (recv) + deferred decryption | Buffers ciphertext; reveals its server-write-key **share** to the prover at close | Can't-learn: the verifier holds all recv ciphertext but only its own key share — it can never reconstruct the server-write key. The reveal is one-directional (verifier→prover). |
+| Commitment | Accepts commitment messages | Can't-learn: salted hashes hide committed spans without their blinders, which stay with the prover. |
+| Verification | Checks openings and keystream equations honestly | Can't-learn: keystream bytes are decoded to the verifier **only at revealed byte offsets** (M6); redacted offsets' keystream — and hence plaintext — remain padded by the prover's share. |
+
+**Statement:** v0's redaction guarantee is *can't-learn* at every phase; no
+phase relies on the verifier declining to look at data it holds. What a
+curious verifier *does* legitimately learn — and this is the declared
+leakage budget, not a hole — is metadata: transcript lengths, record
+boundaries and timing, which byte ranges were committed, and which were
+revealed.
 
 ---
 
@@ -154,7 +189,7 @@ adapters → protocol logic → role binaries.
 | `nt-mpc` | Hand-rolled semi-honest share conversion (A2M/M2A over OLE-from-OT), GF(2^128) and P-256 share arithmetic | Pure protocol algebra over an abstract channel; no TLS knowledge. Semi-honest-correct only (stated, not hidden). |
 | `nt-tls` | Minimal TLS 1.2 client state machine (one suite), record framing, handshake transcript hashing, cert-chain validation via `webpki` | Emits/consumes records; delegates key material to the split key schedule. Never holds a full session key. |
 | `nt-prover` | Prover-side orchestration: setup, joint handshake, record co-run, commitment, interactive prove | Owns plaintext; drives `SecurityMode`. Typed phase state machine. |
-| `nt-verifier` | Verifier-side orchestration: setup, handshake co-run, ciphertext co-authentication, interactive verify | Never receives plaintext or blinders for redacted ranges. Typed phase state machine. |
+| `nt-verifier` | Verifier-side orchestration: setup, handshake co-run, ciphertext co-authentication, interactive verify | Never receives plaintext or blinders for redacted ranges; never reconstructs a full write key. Typed phase state machine. |
 | `nt-cli` | Dev/CLI tooling: run a prover or verifier, point at a fixture server, dump telemetry | No protocol logic; wiring only. |
 | `nt-testutil` | Test fixtures: deterministic RNG seeding, a local TLS-like/stock TLS 1.2 fixture server, golden-vector loaders | Test-only; never a dependency of shipping crates. |
 
@@ -217,6 +252,25 @@ The five reference phases and where they live:
    records buffered; after close the server-write key is revealed to the
    prover for local decryption. *Lineage: AES-CTR keystream via per-block
    evaluation; GHASH via shared H-powers, odd powers by share conversion.*
+
+   **The deferred-decryption invariant (load-bearing).** Revealing the
+   verifier's server-write-key share to the prover is sound **only because**,
+   at the moment of reveal: (1) the connection is closed (`close_notify`
+   observed or transport terminated), so the server accepts no further
+   records under this key; and (2) the verifier's ciphertext-and-tag log is
+   already sealed, so the record set the proof is about is fixed. Given
+   both, a prover holding the full key can forge valid-looking AES-GCM
+   records but has nowhere to put them — the server won't act on them and
+   the verifier's transcript is closed. **If revealed any earlier**, the
+   prover could unilaterally encrypt requests the verifier never
+   co-authorized and fabricate "received" records before the verifier logs
+   them: the co-authentication argument collapses. The reveal is strictly
+   one-directional — the **verifier never reconstructs any full write key**
+   (§4 per-phase table; otherwise redaction of received data is void). The
+   state machines must make the ordering unrepresentable: the key-share
+   reveal message is only constructible from the post-close, log-sealed
+   state. This invariant justifies the entire v0 deferred-only
+   simplification.
 4. **Commitment** — after close, the prover commits to byte ranges as salted
    hashes `H(msg ‖ blinder)` with per-span random blinders; each span is an
    independent commitment (no Merkle tree in v0). *Lineage: salted-hash range
@@ -267,6 +321,22 @@ needs them.
 **Constant-time.** Comparisons of secrets (tag checks, commitment openings
 where a secret is compared) use `subtle`. Share arithmetic avoids
 secret-dependent branches.
+
+**Failure semantics: abort vs. error.** Semi-honest still requires defined,
+privacy-safe failure behavior. Failures are classified once, in `nt-types`:
+
+| Failure | Class | Behavior | What it leaks |
+|---|---|---|---|
+| Declared-size undershoot (transcript exceeds `max_sent`/`max_recv`) | **Hard abort** | Session unrecoverable; zeroize and drop all shares | That the transcript exceeded a (public) declared bound — acceptable by design. |
+| Record tag mismatch | **Hard abort** | Session unrecoverable (a tampered or corrupted link) | Nothing secret; the record index of the failure. |
+| Certificate-chain / handshake-signature failure | **Hard abort** | Refuse before any application data | Server identity material only (already public). |
+| Phase-order violation / malformed frame on the prover↔verifier channel | **Hard abort** | Protocol error; state machine refuses the transition | Phase + error category only. |
+| Transient I/O error (either link) | **Recoverable** | Bounded retries with backoff; abort when the budget is exhausted | Retry counters in telemetry. |
+| Commitment opening mismatch, invalid disclosure range (during verify) | **Verification failure, not protocol abort** | The proof is rejected; session state and logs remain intact for diagnosis | Which check failed (category), never the expected secret value. |
+
+Hard aborts are **fail-closed**: all key shares, blinders, and buffered
+plaintext are zeroized before the error propagates. Error types carry phase
+and category, never key material, blinders, or plaintext.
 
 **Privacy-safe logging / never-cross-a-boundary lists.**
 - **Never logged:** session keys, key shares, blinders, unrevealed plaintext,
@@ -339,9 +409,16 @@ Each names the construction it reproduces.
   random shares, additive/multiplicative homomorphism); negative (mismatched
   correlation counts).
 - **Acceptance:** share conversion reconstructs correct products/sums over
-  thousands of randomized property runs against an in-process channel.
-- **Risks:** subtle field-endianness / bit-order bugs in GF(2^128) —
-  mitigated by golden vectors.
+  thousands of randomized property runs against an in-process channel;
+  **gating precondition:** the GF(2^128) share arithmetic reproduces GHASH
+  values from a reference AES-128-GCM implementation (the `aes-gcm` crate)
+  on golden vectors *before* any downstream milestone consumes this module.
+- **Risks:** **the odd-power share conversion over GF(2^128) is the subtlest
+  cryptography in v0, and a semi-honest bug here is SILENT** — it produces a
+  wrong tag, not a crash, and every downstream integration test would chase
+  it in the wrong layer. GHASH's reflected bit order and field-endianness
+  are the classic traps. Hence the golden-vector gate above: reference
+  vectors come **before** integration, not after.
 - **Observability:** counters for correlations consumed vs. allocated.
 - **Lineage:** A2M/M2A share conversion over OLE-from-OT; GF(2^128) share
   arithmetic with local squaring for even powers.
@@ -385,8 +462,10 @@ Each names the construction it reproduces.
   decoded to both, plaintext private to prover; outbound request encrypted;
   inbound buffered; deferred decryption after `close_notify`.
 - **Invariants:** verifier never obtains plaintext during the session; tag
-  authenticates every record; server-write key revealed **only after** the
-  ciphertext transcript is fixed.
+  authenticates every record; the server-write-key share is revealed only
+  verifier→prover, and only from the post-close, log-sealed state (the
+  deferred-decryption invariant of §7 — the state machine makes an earlier
+  reveal unrepresentable); the verifier never reconstructs any full key.
 - **Tests:** golden vectors (GCM tag/keystream vs. `aes-gcm` on known
   key/nonce); integration (full request/response with a stock server, then
   deferred decrypt yields correct plaintext); property (tag holds over random
@@ -395,8 +474,10 @@ Each names the construction it reproduces.
 - **Acceptance:** end-to-end request to a stock TLS 1.2 server, response
   buffered and correctly decrypted post-close; verifier holds only
   ciphertext + tags.
-- **Risks:** GHASH share bookkeeping across records — mitigated by
-  per-record golden vectors.
+- **Risks:** GHASH share bookkeeping across records — the silent-wrong-tag
+  failure mode called out in M2 applies here compounded; per-record golden
+  vectors against the reference `aes-gcm` implementation are required before
+  this milestone's integration tests run, per the M2 gate.
 - **Observability:** bandwidth + GHASH-share-work metrics; per-record span.
 - **Lineage:** AES-CTR keystream per-block; GHASH via shared H-powers.
 - **Seam:** post-close hook (empty) where in-circuit tag verification
@@ -421,6 +502,14 @@ Each names the construction it reproduces.
 - **Lineage:** salted-hash range commitments.
 - **Seam:** commitment API shaped so a future commitment-to-ciphertext
   binding proof can consume the same range/secret structures.
+- **Merkle-tree compatibility check (outcome: nothing precluded):** portable
+  attestation will likely want a Merkle tree over spans. Checked: flat
+  independent commitments are exactly the *leaves* such a tree would
+  aggregate — a tree layer later hashes `leaf = H(direction ‖ range ‖
+  commitment)` over the same openings, unchanged. One requirement recorded
+  now: store each commitment with a **canonical encoding of its direction
+  and §3.5 range and a stable ordering/id**, so future leaf encodings are
+  deterministic.
 
 ### M6 — Interactive verification
 - **Goal:** the interactive prover→verifier proof that revealed ranges are
@@ -430,12 +519,22 @@ Each names the construction it reproduces.
   `nt-transcript`.
 - **Scope:** prover reveals selected ranges + blinders; verifier checks (a)
   session identity (cert chain + handshake signature over ephemeral key, from
-  M3 state), (b) revealed plaintext decrypts the authenticated ciphertext
-  under the revealed server-write key (semi-honest: verifier recomputes
-  AES-CTR over the revealed ranges and checks against stored ciphertext), (c)
-  redacted ranges absent; outputs a verified partial transcript.
+  M3 state), (b) revealed plaintext matches the authenticated ciphertext via
+  **byte-selective keystream disclosure**: the parties re-run the 2PC
+  keystream evaluation for exactly the blocks containing revealed bytes, and
+  the keystream is decoded to the verifier **only at revealed byte offsets**
+  (coordinates per §3.5); the verifier checks `pt[i] ⊕ ks[i] ==
+  stored_ct[i]` at those offsets, (c) redacted ranges absent; outputs a
+  verified partial transcript. The verifier **never receives a full write
+  key** — that would let it decrypt the whole received transcript and void
+  redaction (§4). Sound at semi-honest because the prover inputs its true
+  key share to the re-run; binding against a lying key share is exactly the
+  §11 commitment-to-ciphertext proof, and this step is the `SecurityMode`
+  dispatch point where that proof later replaces the semi-honest decode.
 - **Invariants:** verifier accepts only ranges that open against commitments
-  *and* match the ciphertext; redacted positions are marked, never inferred.
+  *and* match the ciphertext at the disclosed offsets; keystream bytes at
+  redacted offsets are never decoded to the verifier; redacted positions are
+  marked, never inferred.
 - **Tests:** integration (full prove/verify over M3–M5 output); negative
   (bad commitment, wrong domain/session binding, wrong key, out-of-range
   disclosure, reordered/replayed/truncated proof messages tested under the
@@ -481,12 +580,19 @@ is a QuickSilver-style **VOLE-ZK with IT-MACs** (one field element per AND
 gate; information-theoretic MACs `M = K + x·Δ` over GF(2^128), a batched
 random-linear-combination consistency check) — named for lineage only.
 
-| Seam (milestone) | Future check | Construction that fills it | Rough cost |
-|---|---|---|---|
-| Post-close re-proof hook (M4) | Re-prove the co-run computations were done honestly | Post-hoc VOLE-ZK re-execution of the session's circuits | One extra pass over the AES circuits in ZK; dominated by AND-gate count of the record layer. |
-| Commitment-to-ciphertext binding (M5) | Prove committed plaintext is the true decryption of the authenticated ciphertext | In-ZK AES-CTR consistency: revealed/committed bytes ⊕ keystream = stored ciphertext | ~one AES-128 circuit per committed block, in ZK; ~6.4k AND gates/block × one field element each. |
-| Dual-PMS equality check (M3) | Detect a prover that fed inconsistent key shares | Run the share conversion twice and check `PMS₀ ⊕ PMS₁ = 0` inside a circuit | One extra share-conversion pass + a small equality circuit; cheap relative to the record layer. |
-| In-circuit tag verification (M4) | Authenticate received records from the *verifier's* side against a malicious prover | Recompute J0/GHASH in ZK from shared key wires and check against wire tags | One GHASH+block-cipher evaluation per record in ZK. |
+| Seam | Future check | Construction that fills it | Rough cost | Interface host (v0 milestone) |
+|---|---|---|---|---|
+| Post-close re-proof hook | Re-prove the co-run computations were done honestly | Post-hoc VOLE-ZK re-execution of the session's circuits | One extra pass over the AES circuits in ZK; dominated by AND-gate count of the record layer. | **M4** — the empty post-close hook defined on the record-layer orchestrator. |
+| Commitment-to-ciphertext binding | Prove committed plaintext is the true decryption of the authenticated ciphertext | In-ZK AES-CTR consistency: revealed/committed bytes ⊕ keystream = stored ciphertext | ~one AES-128 circuit per committed block, in ZK; ~6.4k AND gates/block × one field element each. | **M5** range/blinder structures + **M6** — the byte-selective keystream-decode step is the `SecurityMode` dispatch point this proof replaces; both consume §3.5 coordinates. |
+| Dual-PMS equality check | Detect a prover that fed inconsistent key shares | Run the share conversion twice and check `PMS₀ ⊕ PMS₁ = 0` inside a circuit | One extra share-conversion pass + a small equality circuit; cheap relative to the record layer. | **M3** — the empty post-handshake hook. |
+| In-circuit tag verification | Authenticate received records from the *verifier's* side against a malicious prover | Recompute J0/GHASH in ZK from shared key wires and check against wire tags | One GHASH+block-cipher evaluation per record in ZK. | **M4** — the same post-close hook, over the M4 record index. |
+
+**Cross-check (milestones vs. seams):** every deferred check lands in an
+interface slot an earlier milestone already defines — M3's post-handshake
+hook, M4's post-close hook and record index, M5's range/blinder structures,
+M6's keystream-decode dispatch point. None needs a slot an earlier
+milestone fails to provide; the shared §3.5 coordinates are what let the
+M5/M6-hosted binding proof address the same bytes as M4's records.
 
 Only when a malicious-security milestone begins would a VOLE-ZK dependency
 enter the tree. The v0 interfaces (the empty hooks, the range/secret
@@ -622,7 +728,44 @@ proves the core architecture first**.
 
 ---
 
-## 17. Plan assumptions
+## 17. Assumptions that would invalidate the design if wrong
+
+Distinct from the softer plan assumptions below: if any entry here is false,
+the design is not merely inconvenienced — a stated guarantee fails. Each
+names the guarantee it carries.
+
+1. **The semi-honest prover assumption holds in deployment.** Everything in
+   §4's "defer" column depends on it; against an adversarial prover, v0's
+   verifier output proves nothing until §11.
+2. **The verifier never obtains both shares of any write key.** The whole
+   can't-learn redaction argument (§4) rests on this. Any "let the verifier
+   just decrypt and check" shortcut silently converts privacy into
+   won't-look.
+3. **The server-write-key reveal happens strictly after close + log-seal**
+   (the §7 invariant). Earlier reveal collapses co-authentication; the typed
+   state machines are the enforcement, so a refactor that flattens them
+   invalidates the design.
+4. **GCM nonce discipline: no keystream position is generated or revealed
+   twice.** The prover's keystream share is the one-time pad hiding
+   plaintext from the curious verifier; per-record nonce uniqueness plus
+   reveal-once bookkeeping in M6 make it *one-time*. Reuse breaks TLS
+   security and redaction at once.
+5. **The GF(2^128) share arithmetic is bit-for-bit GHASH-correct.** A silent
+   error (M2 risk) yields wrong tags; the golden-vector gate is the
+   control, and removing it invalidates the correctness story.
+6. **Salted hashes `H(msg ‖ blinder)` are hiding for short, low-entropy
+   spans** (hash as PRF/random oracle, 16-byte blinder). Weaken either and
+   commitments to auth tokens leak by dictionary attack.
+7. **The combined ephemeral key is indistinguishable from a normal
+   client's.** Mathematically true (sum of random P-256 points is a random
+   point); the operational half — that handshake timing or fingerprint
+   doesn't make the joint client blockable — must be re-checked against real
+   servers (M3's stock-server test).
+8. **Target servers keep accepting TLS 1.2 ECDHE-P256 / AES-128-GCM.** One
+   suite only; if targets disable it, v0 has no subject matter, and TLS 1.3
+   is a design change (new key schedule and record layer), not a patch.
+
+## 18. Plan assumptions
 
 Everything guessed or reconciled, stated plainly:
 - **The working directory is not an empty repository.** The task framed a
@@ -649,7 +792,7 @@ Everything guessed or reconciled, stated plainly:
 
 ---
 
-## 18. Acceptance test for this plan
+## 19. Acceptance test for this plan
 
 > **A reviewer familiar with TLSNotary must be able to take any TLSN feature
 > and either find where in the milestones it lands, or find it explicitly in
