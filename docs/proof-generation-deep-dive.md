@@ -737,7 +737,7 @@ All `mpz` crates are pinned to git `github.com/privacy-ethereum/mpz` rev
 |---|---|---|
 | `mpz-ot` | OT stack: `chou_orlandi` base OT, `kos` OT extension, `ferret` silent OT (LPN), RCOT/ROT wrappers | Built in `crates/tlsn/src/deps/{prover,verifier}.rs`; consumed by everything below |
 | `mpz-garble`, `mpz-garble-core` | Semi-honest garbled-circuit VM (`Garbler`/`Evaluator`, `Delta`) | The "MPC VM" half of DEAP; all AES/PRF circuits during the live session |
-| `mpz-zk` | VOLE-based ZK VM (`Prover`/`Verifier`) over derandomized COT | The "ZK VM" half of DEAP; plaintext-consistency and hash-commitment proofs in Phase 4; tag verification |
+| `mpz-zk` | VOLE-based ZK VM (`Prover`/`Verifier`); consumes raw *random* COT from the shared Ferret/KOS chain and derandomizes in-protocol via adjustment bits (the `DerandCOT` wrappers feed the *garbling* VMs instead — `crates/tlsn/src/deps/prover.rs:33-35, 80`) | The "ZK VM" half of DEAP; plaintext-consistency and hash-commitment proofs in Phase 4; tag verification |
 | `mpz-ole` | Oblivious linear evaluation over OT | Substrate for share conversion |
 | `mpz-share-conversion` | `AdditiveToMultiplicative` / `MultiplicativeToAdditive` over a field | EC point addition (P-256) in key exchange; GHASH powers (GF(2¹²⁸)) in the record layer |
 | `mpz-fields` | `P256`, `Gf2_128` field arithmetic | Same two sites |
@@ -801,15 +801,27 @@ construction, not citation.
   dedicated `xor` circuit, `cipher/src/lib.rs:151`); the actual garbling
   scheme lives inside `mpz-garble`, outside this repo. *(inferred —
   optimizations standard in mpz-generation garbling; not verifiable from this
-  tree)*
+  tree)* Note that the ZK VM has its own, mechanistically unrelated "free
+  XOR": linear gates are free there by the additive homomorphism of IT-MACs
+  (`Mac + Mac` / `Key + Key` computed locally with no communication,
+  `mpz/crates/zk-core/src/prover.rs:201-204`), not by any garbling trick.
 - **QuickSilver / VOLE-based ZK** — K. Yang, P. Sarkar, C. Weng, X. Wang,
   *QuickSilver: Efficient and Affordable Zero-Knowledge Proofs for Circuits
   and Polynomials over Any Field*, ACM CCS 2021, ePrint 2021/076. The
-  `mpz_zk` prover/verifier built over derandomized correlated OT
-  (`deps/prover.rs:28-35`) matches this family: interactive,
-  designated-verifier ZK from VOLE correlations — which is why the Phase-4
-  proofs are cheap enough to run over the whole transcript. *(inferred from
-  construction; the crate does not name its protocol)*
+  attribution is **explicit in the pinned mpz revision**: the crate opens
+  with `//! QuickSilver zk protocol https://eprint.iacr.org/2021/076`
+  (`mpz/crates/zk-core/src/lib.rs:1`), and the consistency-check code cites
+  the paper's own figure and step numbers in its doc comments (*"Figure 5,
+  Step 7.b"* / *"Step 7.c"*, `mpz/crates/zk-core/src/check.rs:64-65,
+  161-162`; *"figure 4"*, `mpz/crates/zk-core/src/vole.rs:11,22`) — though
+  the tlsn repository itself never names the protocol. The ZK VMs consume
+  raw *random* correlated OT from the shared Ferret/KOS chain
+  (`ProverZk`/`VerifierZk` type aliases, `crates/tlsn/src/deps/prover.rs:34-35`,
+  `deps/verifier.rs:34-35`) and derandomize inside the protocol via
+  per-input and per-gate adjustment bits — interactive,
+  designated-verifier ZK from VOLE correlations, which is why the Phase-4
+  proofs are cheap enough to run over the whole transcript. See §9.3 for
+  where the implementation deviates from the paper.
 - **Gilboa-style OLE from OT** — N. Gilboa, *Two Party RSA Key Generation*,
   CRYPTO 1999. The classic bit-decomposition technique underlying
   OT-based oblivious linear evaluation, as in `mpz-ole` over RCOT — the
@@ -827,7 +839,73 @@ construction, not citation.
   MPC-based protocol is a from-scratch redesign in the DECO lineage.
   *(historical context, not derived from this repository)*
 
-### 9.3 Version caveats
+### 9.3 Implementation vs. the QuickSilver paper
+
+`mpz-zk` (read at mpz commit `6ebfe61`, the rev this workspace pins) is a
+faithful QuickSilver implementation in its core algebra — the per-AND-gate
+adjustment bit, the IT-MAC relation `M = k + x·Δ`, and the batched
+`W = U ⊕ Δ·V` consistency check masked by a degree-1 VOPE all match ePrint
+2021/076, Figures 4 and 5, and the code cites those figures directly. It
+deviates from the paper in the following ways. Rationale entries are labeled
+**[documented]** (stated in code or doc comments) or **[inferred]**
+(engineering judgment from reading the code — not an authoritative claim).
+
+| Paper | Implementation | Evidence | Rationale |
+|---|---|---|---|
+| Challenge χ sent interactively by the verifier; combined via powers χⁱ (with a seed-expanded independent-χᵢ variant offered for computational efficiency) | No verifier message at all: a running BLAKE3 transcript is finalized into a seed, `ChaCha12Rng` expands it into an independent χᵢ per AND-gate triple, one RNG stream per 512-triple segment (`SEGMENT_SIZE`) | `mpz/crates/zk-core/src/check.rs:21, 87-143` | **[inferred]** avoids computing t sequential powers in GF(2¹²⁸), parallelizes cleanly (rayon over segments), and makes the check non-interactive; **[documented — in the paper, not the code]** the trade is information-theoretic → computational soundness in the random-oracle model, with the paper's q_H hash-query term entering the bound. See prose below for the transcript-ordering argument. |
+| One consistency check per proof (Fig. 5 step 7 runs once) | The check runs per **batch** of `batch_size` AND gates (default 200,000), consuming 128 fresh RCOTs (one degree-1 VOPE mask) and one `UV` message per batch, plus a final partial-batch check | `mpz/crates/zk/src/prover.rs:193-219`; `mpz/crates/zk/src/config.rs:3-4` | **[documented]** the constant is *"empirically chosen … provides the best performance"* (`config.rs:3`); **[inferred]** batching bounds the triple buffer for streaming execution and lets RCOT budgeting stay incremental — the same pay-as-allocated discipline as §2's preprocessing. Cost analysis in prose below. |
+| Plain IT-MAC `k = m + x·Δ`; wire values tracked separately | "Pointer bit" convention: `LSB(Δ)` is forced to 1, so `LSB(M) = LSB(k) ⊕ x` — the authenticated bit rides in the MAC's low bit and is read locally during gate evaluation (`w_z = mac_x.pointer() & mac_y.pointer()`) | `mpz/crates/memory-core/src/correlated.rs:22-37`; `mpz/crates/zk-core/src/prover.rs:211-217` | **[documented]** the module doc states the job: the value *"can be recovered easily given only 1 bit of the MAC and of the key"*, and notes it forms an additive sharing `x = LSB(k) ⊕ LSB(M)` — no separate wire-value storage or decode round-trips. **[inferred]** consequence: Δ is constrained to odd values, losing 1 bit of entropy (2⁻¹²⁷ vs 2⁻¹²⁸ in Δ-guessing terms); this is acknowledged nowhere in the code and is a negligible factor-2 in the soundness bound. |
+| Subfield VOLE over F_p with MACs in F_p^r, realized by dedicated LPN-based sVOLE protocols | p = 2, r = 128, so sVOLE degenerates to plain correlated OT (`bool` choices, 128-bit `Block` messages), delivered by Ferret over KOS over Chou–Orlandi; the code itself calls RCOT outputs *"Keys from subfield VOLE"* | `mpz/crates/zk/src/prover.rs:55`, `verifier.rs:64`; `mpz/crates/zk-core/src/vole.rs:15`; `mpz/crates/memory-core/src/correlated.rs:17-20` | **[documented]** the binary-field restriction is explicit (*"At the moment we only support the binary field"*). **[inferred]** the *same* Δ keys both the KOS/Ferret RCOT sender and the ZK verifier (`crates/tlsn/src/deps/verifier.rs:56-61, 84`): a COT output `q = t ⊕ c·Δ` already *is* the IT-MAC relation, so OT outputs become MACs with zero conversion. Trust consequence: one Δ secures both the OT-extension and MAC layers — a Δ compromise breaks both at once. |
+| §5 of the paper: polynomial satisfiability via arbitrary-degree VOPE | Circuit satisfiability only; the only VOPE is degree 1 (*"This implementation is specifically for degree 1"*) | `mpz/crates/zk-core/src/vole.rs:1-4`; `check.rs` (AND-gate check only) | **[documented absence]** the paper title's "…and Polynomials" does **not** apply to this stack; nothing in tlsn depends on it. |
+| Appendix: the Ferret-based instantiation admits multiple global-key (Δ-guess) queries; adversary success bounded by q/2^κ | No Δ-guess bookkeeping anywhere in `mpz-zk` or the Ferret module; a failed check is a bare abort (`CheckError::Invalid`, *"Invalid! Call the police."*) | `mpz/crates/zk-core/src/check.rs:242-245`; grep of `zk`, `zk-core`, `ot/src/ferret` for guess/key-query tracking: no hits | **[inferred — operational, not an implemented control]** each failed check aborts the session, so each Δ guess costs the Prover a full re-setup including preprocessing. This is the one place where the paper's security analysis has no code counterpart; see prose below. |
+| Prover sends all mult-gate values; transmission format unspecified | Adjustment bits are streamed in 8,000-bit chunks as they are produced, never buffered whole (*"Stream the `adjust` bits to avoid buffering them in memory"*) | `mpz/crates/zk/src/prover.rs:166-175` | **[documented]** this is the visible mechanism behind QuickSilver's memory-proportional-to-cleartext-evaluation property. |
+
+**Challenge ordering and why it is sound.** The Fiat–Shamir-style derivation
+only works if the challenge is sampled *after* the prover has committed
+everything the challenge is supposed to audit. The code preserves exactly
+that ordering: input commitments arrive in `ProverFlush` messages whose
+adjustment bits are hashed into the running transcript on both sides
+(`send_flush`/`receive_flush`, exercised at
+`mpz/crates/zk-core/src/lib.rs:112-117`); each batch's per-gate adjustment
+bits are absorbed into the transcript (`check.rs:87`) **before** the seed is
+finalized (`check.rs:91`); and each batch's `U, V` openings are absorbed
+immediately after computation (`check.rs:153-154`, mirrored verifier-side at
+`check.rs:237-238`), binding them into every *subsequent* batch's challenge.
+So by the time χᵢ exist, the prover's MACs and corrections for that batch
+are fixed — the lottery is drawn only after all tickets are printed — and a
+prover cannot adapt its per-gate values to the challenge, within a batch or
+across batches. What is given up relative to the interactive protocol is
+information-theoretic soundness: a prover who can find a transcript hash
+whose expansion zeroes the accumulated error term wins, which is the paper's
+q_H random-oracle term. **[inferred from code structure; soundness framing
+from the paper]**
+
+**Per-batch cost and soundness accounting.** Each batch costs one extra
+`UV` message (32 bytes) and 128 RCOTs for the fresh VOPE mask — noise
+against the one-bit-per-AND-gate main cost. Soundness degrades by at most a
+union bound over batches: with the paper's per-check bound (on the order of
+2⁻¹⁰⁰ for this parameterization) and TLSNotary-scale circuits — one AES-128
+block is ~6,400 AND gates **[inferred from the standard Bristol circuit;
+not counted in this tree]**, so even a maximum-size 16 KB-received session
+stays within a few batches at the 200,000-gate default — the accumulated
+bound is unchanged in any practical sense. The batch boundary also
+interacts with §2's story: RCOTs for checks are allocated incrementally
+(`prover.rs:221-225` pre-allocates the next batch's 128), keeping the ZK
+VM's OT appetite predictable for the preprocessing budget.
+
+**The missing Δ-guess ledger.** The paper's multi-query analysis assumes
+someone counts q, the number of global-key queries an adversary gets. In
+this stack nobody counts: the abort is stateless, and a Prover could in
+principle open fresh sessions and burn one Δ guess per session against a
+long-lived Verifier Δ. What actually bounds q operationally is that Δ is
+generated fresh per session (`Delta::random`,
+`crates/tlsn/src/deps/verifier.rs:56`) — a guess learned about one session's
+Δ says nothing about the next — and each attempt costs a full preprocessing
+run. That is an architectural mitigation, not an implemented control, and
+it is the only claim in this appendix that rests on deployment posture
+rather than code. **[inferred]**
+
+### 9.4 Version caveats
 
 This document describes the tree at `crates/tlsn` version
 `0.1.0-alpha.16-pre` (workspace `Cargo.toml`). Notable version-specific
@@ -841,3 +919,8 @@ facts that have changed before and may change again:
   SHA-256 → BLAKE3 → Keccak-256 when covering reveals
   (`transcript/proof.rs:23`).
 - Deferred decryption is **on by default** (`crates/mpc-tls/src/config.rs:43`).
+- The QuickSilver attribution and the divergence analysis in §9.3 were
+  verified on 2026-07-03 against the pinned mpz revision
+  `6ebfe619490c3155a589fc6a3be83b0976de19dc` (tag `v0.1.0-alpha.6`, per
+  `Cargo.lock`) and this tree's `crates/tlsn` sources. `mpz/…` paths in this
+  document refer to that revision.
