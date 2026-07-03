@@ -20,6 +20,7 @@ target/
 
 # transcript
 *.json
+!.claude/settings.json
 
 # env var
 *.env
