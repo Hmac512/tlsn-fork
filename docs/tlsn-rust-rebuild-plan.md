@@ -65,7 +65,7 @@ design change.
 | TLS version | 1.2 only (offer 1.2; abort on any other negotiated version) |
 | Curve | secp256r1 (P-256) only |
 | Cipher suites offered | `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` |
-| Extended master secret (RFC 7627) | **REQUIRED** — offered; **hard-abort if the server does not negotiate it** (see §10 and the session-binding story in §10) |
+| Extended master secret (RFC 7627) | **REQUIRED** — offered; **hard-abort if the server does not negotiate it** (§10 failure table; session-binding rationale in the paragraph below this table) |
 | SNI | Required (server_name always sent) |
 | ALPN | Offer `http/1.1` only |
 | Compression | null only |
@@ -174,6 +174,34 @@ legitimately learn — the declared leakage budget, not a hole — is metadata:
 transcript lengths, record boundaries and timing, which byte ranges were
 committed, and which were revealed.
 
+### Keystream-share holders, per direction (normative)
+
+Retaining keystream shares to M7 (§7) raises a direction-specific question:
+does the verifier ever hold enough to read a *redacted* byte? The answer must
+be no in **both** directions, or §21.2 is violated. The invariant that makes
+it no: **the verifier holds only its own additive share `ks_V`, never `ks_P`
+and never the full keystream; the prover opens `ks_P` only at revealed
+offsets.** A redacted byte is therefore always masked by the prover's unopened
+share `ks_P` — `ct ⊕ ks_V = pt ⊕ ks_P` is not plaintext.
+
+| Direction | How keystream is produced | Prover holds (M5→M7) | Verifier holds (M5→M7) | At M7 |
+|---|---|---|---|---|
+| **SENT** | 2PC keystream during the live session; `ct = pt ⊕ ks_P ⊕ ks_V` decoded to both | `pt`, `ks_P`, `ct` (so it independently knows the full keystream `pt ⊕ ct`) | `ct` and `ks_V` **only** — never `ks_P`, never the full keystream | prover opens `ks_P[i]` at revealed offsets; verifier checks `pt[i] ⊕ ks_P[i] ⊕ ks_V[i] == ct[i]`. Redacted offsets: `ks_P` unopened → masked. |
+| **RECV** | deferred 2PC keystream at close; verifier releases its `ks_V` to the prover so the prover can decrypt | `pt` (after decrypt), `ks_P`, its copy of `ks_V`, `ct` | `ct` and `ks_V` **only** — never `ks_P` | identical discipline: prover opens `ks_P[i]` at revealed offsets; redacted offsets masked by unopened `ks_P`. |
+
+The apparent asymmetry — on SENT the prover already knows the full keystream
+(`pt ⊕ ct`), on RECV the verifier hands its `ks_V` to the prover — does **not**
+give the verifier any extra power in either case: the verifier's view is
+`ks_V` plus `ct`, i.e. `pt ⊕ ks_P`, in both directions. `ks_V`'s only role is
+to give the verifier's revealed-offset check independence from the prover; it
+never enables reading a redacted offset. **Outcome chosen: strict can't-learn
+holds in both directions with no design change** — because keystream is
+additively *shared* (the verifier holds a share, not the full keystream) and
+`ks_P` is opened only at revealed offsets. The failure mode to guard against
+is a variant where the verifier ends up with the full sent keystream (or with
+`ks_P`) for any redacted offset — trapdoor #4, and the reason this table is
+normative, not illustrative.
+
 ---
 
 ## 6. Dependency policy
@@ -266,8 +294,10 @@ blinders, and unrevealed plaintext live in dedicated types that:
   exception; none expected in v0),
 - implement `Zeroize`/`ZeroizeOnDrop`,
 - own their lifetime explicitly. **Key shares drop after deferred decryption;
-  keystream shares are retained to M7** (they are what verification opens);
-  blinders drop after the proof.
+  keystream shares are retained to M7** (they are what verification opens),
+  subject to the per-direction holder discipline in §5 — the verifier retains
+  only its own share `ks_V`, never `ks_P` or the full keystream; blinders drop
+  after the proof.
 
 No macros, `unsafe`, DSLs, or framework-style generics beyond a plain trait
 per seam.
@@ -346,9 +376,10 @@ compiles, tests pass, and the security property is gone.
 3. **2PC record layer** — AES-128 evaluated in `nt-garble` as key-schedule +
    per-block circuits in CTR mode for keystream; keystream XOR into data is a
    cheap separate step. GHASH is **not** in-circuit: `H` is computed once
-   (garbled), additively shared out, and tag/polynomial work happens on
-   GF(2^128) shares (odd powers via share conversion, even powers by local
-   squaring). Ciphertext is decoded to both parties; plaintext stays private
+   (garbled), additively shared out across a **boolean→arithmetic bridge** (the
+   mirror of the PMS bridge above; a silent-failure seam pinned in M5), and
+   tag/polynomial work happens on GF(2^128) shares (odd powers via share
+   conversion, even powers by local squaring). Ciphertext is decoded to both parties; plaintext stays private
    to the prover. **Handshake and alert records decrypt online** (the server
    Finished's verify-data must be checked before app data flows). **Only
    application-data records are deferred**: buffered during the session, their
@@ -599,10 +630,16 @@ Eight milestones. Each leaves the repo compiling, tested, reviewable, with its
   v0 and a bug is SILENT** — wrong tag, not a crash. GHASH's bit-reflected
   representation and endianness are the traps; hence the gate.
 - **Observability:** correlations consumed vs. allocated; OT-extension bytes.
-- **Lineage:** IKNP/KOS-style semi-honest OT extension; A2M/M2A over
-  OLE-from-OT; GF(2^128) arithmetic with local squaring for even powers.
+- **Lineage (semi-honest primitives; standard references, §24):** base OT =
+  Chou-Orlandi; OT extension = **IKNP** semi-honest, using **KOS**'s
+  construction but **omitting KOS's malicious correlation check** (deferred to
+  §14); OLE-from-OT = **Gilboa** bit-decomposition; A2M/M2A over OLE-from-OT;
+  GF(2^128) arithmetic with local squaring for even powers. v0 does **not** use
+  LPN-style correlated OT (Ferret-core) — that is a future bandwidth
+  optimization only (§16), kept off the M2 path to stay on the simpler,
+  more-auditable IKNP/KOS lineage.
 - **Explicitly not here:** no dual-PMS check, no ZK, no IT-MACs, no KOS
-  consistency check (§14 seam).
+  consistency check, no LPN/Ferret COT (all §14 or §16).
 
 ### M3 — Garbled-circuit engine (boolean 2PC) — *the largest single component*
 - **Goal:** a hand-rolled semi-honest half-gate garbled-circuit evaluator that
@@ -626,8 +663,10 @@ Eight milestones. Each leaves the repo compiling, tested, reviewable, with its
 - **Risks:** this is the biggest, subtlest v0 build; half-gate/free-XOR label
   bookkeeping errors are silent. Golden vectors are the control.
 - **Observability:** gates garbled/evaluated, bytes per circuit.
-- **Lineage:** semi-honest two-halves half-gate garbled circuits; vendored
-  Bristol AES-128 / SHA-256.
+- **Lineage (standard references, §24):** semi-honest **half-gate** garbled
+  circuits (Zahur-Rosulek-Evans) + **free-XOR** (Kolesnikov-Schneider);
+  vendored Bristol AES-128 / SHA-256. A malicious backend (authenticated
+  garbling, WRK-line) is §14, not here.
 - **Seam:** the `Evaluator` trait is where a later authenticated-garbling
   (malicious) backend attaches as a second implementation (§14).
 
@@ -685,6 +724,18 @@ Eight milestones. Each leaves the repo compiling, tested, reviewable, with its
   (8 bytes, big-endian)**; **AAD = 13 bytes `seq ‖ type ‖ version ‖ length`**;
   the number of precomputed shared H-powers is sized from the record-count
   budget. Golden vectors must exercise each pin.
+- **Boolean→arithmetic bridge for GHASH `H` (load-bearing, silent-failure
+  seam).** `H = E_k(0)` is produced by `nt-garble` as **boolean** output bits,
+  but all tag/polynomial work happens in the **GF(2^128) arithmetic share
+  domain** of `nt-mpc`. Feeding one into the other is a representation handoff
+  — the mirror image of M4's arith→boolean PMS bridge, and just as silent when
+  wrong: the garbled-`H` output-bit order and the GF(2^128) share domain must
+  agree on the **bit-reflected** GCM representation (the `R = 0x87` convention
+  above), or every tag is wrong with no crash. M2 tests the share arithmetic
+  and M3 tests garbled output, but **nothing tests the seam between them** —
+  so a dedicated golden vector checks that a known key's garbled-`H` bits,
+  once shared out and recombined in the GF(2^128) domain, reproduce the
+  reference GHASH `H` (bit-reflection preserved across the handoff).
 - **DoD:** end-to-end request/response with a stock server; deferred decrypt
   yields correct plaintext; verifier holds ciphertext + tags + its keystream
   shares, no full key; record-count-budget undershoot aborts.
@@ -695,7 +746,9 @@ Eight milestones. Each leaves the repo compiling, tested, reviewable, with its
   key; **keystream bytes at non-revealed offsets within an AES block are never
   opened.**
 - **Tests:** golden vectors (GCM tag/keystream vs. `aes-gcm`, exercising every
-  pin); integration (full session, deferred decrypt); property (tag over
+  pin; **plus the boolean→arithmetic `H`-bridge vector** — garbled-`H` bits →
+  GF(2^128) shares → recombined `H` matches the reference, bit-reflection
+  preserved); integration (full session, deferred decrypt); property (tag over
   random record sizes; many small records vs. record budget); negative
   (tampered ciphertext → tag fails; reorder → auth fails; hidden `close_notify`
   in a private record → rejected).
@@ -802,9 +855,11 @@ No "build everything at once" milestone exists by construction.
 
 This section **describes**; v0 pulls in none of these dependencies. Each seam
 is where a future `SecurityMode::MaliciousProver` path attaches. The
-construction lineage is a QuickSilver-style **VOLE-ZK with IT-MACs** (one
-field element per AND gate; MACs `M = K + x·Δ` over GF(2^128); a batched
-random-linear-combination check) — named for lineage only.
+construction lineage is a **QuickSilver**-style VOLE-ZK with IT-MACs
+(QuickSilver, §24; one field element per AND gate; MACs `M = K + x·Δ` over
+GF(2^128); a batched random-linear-combination check) — named for lineage
+only. These are a **different lineage** from the v0 semi-honest primitives of
+M2/M3; do not attach these papers to a v0 milestone.
 
 | Seam | Future check | Construction | Rough cost | Interface host (v0 milestone) |
 |---|---|---|---|---|
@@ -813,6 +868,23 @@ random-linear-combination check) — named for lineage only.
 | Dual-PMS equality check | Detect inconsistent handshake key shares | Run share conversion twice; check `PMS₀ ⊕ PMS₁ = 0` in-circuit | One extra conversion + a small equality circuit | **M4** — the post-handshake hook. |
 | Post-close re-proof + in-circuit tag verification | Re-prove the co-run honestly; authenticate received records from the verifier's side | Post-hoc VOLE-ZK re-execution; recompute J0/GHASH in ZK from shared key wires | One extra pass over the AES/GHASH circuits in ZK | **M5** — the post-close hook + record index. |
 | Commitment-to-ciphertext binding | Prove committed plaintext is the true decryption | In-ZK AES-CTR consistency: revealed bytes ⊕ keystream = stored ciphertext | ~one AES-128 circuit per committed block in ZK | **M6** range/blinder structures + **M7** — the keystream-share-opening step is the dispatch point this replaces. |
+
+**Paper lineage per seam (all §24):**
+- **Authenticated-garbling backend** → the authenticated-garbling line
+  (WRK — Wang-Ranellucci-Katz, and successors). **Not in the connector**;
+  cited by standard reference, flagged not-yet-ingested.
+- **Malicious OT-extension** → **KOS**'s consistency check (standard reference),
+  and/or **Ferret**'s near-free malicious COT check (connector) if the extension
+  later moves to the LPN path.
+- **Post-close re-proof + in-circuit tag verification** → **QuickSilver** /
+  **Wolverine** (connector). The per-record AES/GHASH re-proof re-executes the
+  *same* circuit structure across records — a **batched disjunction** — so
+  **Batchman/Robin** (connector) is the relevant batching technique, and
+  **AntMan** (connector, IT-PAC, sublinear communication) the option for very
+  large / SIMD-shaped re-proofs.
+- **Commitment-to-ciphertext binding** → **QuickSilver** (connector).
+- **Dual-PMS equality check** → a protocol-specific construction (run share
+  conversion twice, equality-check in-circuit); no single originating paper.
 
 **Cross-check (milestones vs. seams):** every deferred check lands in a slot an
 earlier milestone defines — M2's OT-extension interface, M3's `Evaluator`
@@ -879,6 +951,15 @@ The reduced/low-bandwidth PRF (roughly halving 2PC compressions by revealing
 intermediate PRF hashes) is a **future flagged option with a stated privacy
 cost**, not in v0 (§2, §20).
 
+**Deferred bandwidth optimization — LPN correlated OT.** v0's OT extension is
+IKNP/KOS (M2), whose preprocessing bandwidth is linear in the OT count. A
+future optimization replaces it with **Ferret**-style LPN-based correlated OT
+(§24, connector), which makes correlated-OT communication sublinear — the main
+lever on the "freight" cost above. It is deliberately **out of v0** (kept off
+the M2 path for auditability, §20); noted here only as the known bandwidth
+lever. Ferret's separate near-free malicious COT check belongs to §14, not
+here.
+
 ---
 
 ## 17. Testing strategy
@@ -921,7 +1002,9 @@ targeted code review**, not automated tests. Named review checklist (§18):
 - blinder generation and lifetime (fresh per span, never sent for redacted
   spans),
 - OT obliviousness (receiver choice bits never leak to sender),
-- keystream-share opening (only revealed offsets; never a whole block),
+- keystream-share opening (only revealed offsets; never a whole block; the
+  verifier holds only `ks_V` per the §5 per-direction holder table, both
+  directions),
 - key-share vs. keystream-share release ordering (post-close only; no full key
   reconstructed by the verifier),
 - logging/serialization boundary lists (§10).
@@ -945,6 +1028,22 @@ independently written spec**. Binding rules for the implementing agent:
   code or `/docs`.
 - Golden vectors are generated from standards/primitive crates (`aes`, `sha2`,
   `aes-gcm`, `p256`), never lifted from a reference repo.
+
+**Citation discipline (two places).**
+- **The plan** cites a paper where a construction *originates* or where v0
+  *deliberately diverges* from it — e.g. M2 cites KOS but records that v0 omits
+  KOS's malicious correlation check. Citations live in the milestone lineage
+  lines and in §14/§16, and are collected in **§24**.
+- **The code** cites, in each module's top-level doc comment, the paper the
+  module's idea came from: **paper short-name + what was taken + what was
+  simplified** (e.g. `nt-ot`: "IKNP/KOS OT extension; took the correlated-OT
+  construction; simplified by omitting KOS's consistency check — see §14").
+- **Scoping rule (do not miscite):** the v0 semi-honest data path and the §14
+  malicious-secure future are **different lineages**. Semi-honest-primitive
+  papers (IKNP, KOS, Chou-Orlandi, Gilboa, half-gate, free-XOR) attach to
+  M2/M3; the VOLE-ZK family (QuickSilver, Wolverine, AntMan, Batchman/Robin)
+  and authenticated garbling attach to §14 **only**. Never attach a
+  malicious-secure VOLE-ZK paper to a v0 milestone.
 
 ---
 
@@ -974,7 +1073,10 @@ Do not invent tooling beyond this shape.
 Explicitly out of scope (each deferred, not forgotten):
 - Malicious-prover security (→ the configurable mode, §14).
 - Malicious-secure hardening: authenticated garbling, KOS consistency check,
-  dual-PMS check, in-circuit tag verification, DEAP-style dual execution (§14).
+  Ferret's malicious COT check, dual-PMS check, in-circuit tag verification,
+  DEAP-style dual execution (§14).
+- LPN-based correlated OT (Ferret-core) as a bandwidth optimization — the M2
+  OT extension stays on the IKNP/KOS path (§16).
 - Portable notary-signed attestation and a presentation/verify split.
 - HTTP-aware / JSON-field commitments (v0 is byte ranges).
 - Online (non-deferred) decryption of application data.
@@ -998,10 +1100,12 @@ If any entry here is false, a stated guarantee fails.
 1. **The semi-honest prover assumption holds in deployment.** Everything in
    §5's "defer" column depends on it; against an adversarial prover, v0's
    output proves nothing until §14.
-2. **The verifier never obtains both shares of any write key, nor keystream
-   shares at redacted offsets.** The whole can't-learn redaction argument (§5)
-   rests on this. Any "let the verifier just decrypt and check" shortcut
-   converts privacy into won't-look.
+2. **The verifier never obtains both shares of any write key, nor `ks_P` (nor
+   the full keystream) at any redacted offset, in either direction.** The whole
+   can't-learn redaction argument (§5, and its per-direction holder table)
+   rests on this — including the sent direction, where the prover independently
+   knows the full keystream but the verifier holds only `ks_V`. Any "let the
+   verifier just decrypt and check" shortcut converts privacy into won't-look.
 3. **The garbled-circuit engine is correct.** It now carries the PRF (M4) and
    the record layer (M5); a half-gate/free-XOR bug is silent (wrong keys or
    wrong keystream, not a crash). The M3 golden-vector gate is the control;
@@ -1079,3 +1183,53 @@ Satisfied by construction:
 Any feature not in a milestone is deliberately in §20; any mechanism in a
 milestone names the construction it reproduces (§13 lineage lines), making
 "avoid obvious architectural mistakes" a checkable property.
+
+---
+
+## 24. References
+
+Two lineages, kept separate (§18 scoping rule): **v0 semi-honest primitives**
+(M2/M3) and the **§14 malicious-secure future**.
+
+### v0 semi-honest primitives — standard references (not yet in the connector)
+
+These are cited by standard reference pending ingestion; **do not fabricate
+docIds for them.**
+- **IKNP** — Ishai, Kilian, Nissim, Petrank, "Extending Oblivious Transfers
+  Efficiently," CRYPTO 2003. *(M2 OT extension, semi-honest.)*
+- **KOS** — Keller, Orsini, Scholl, "Actively Secure OT Extension with Optimal
+  Overhead," CRYPTO 2015. *(M2 uses its construction; v0 omits its malicious
+  correlation check — that check is a §14 seam.)*
+- **Chou-Orlandi** — Chou, Orlandi, "The Simplest Protocol for Oblivious
+  Transfer," LATINCRYPT 2015. *(M2 base OT.)*
+- **Gilboa** — Gilboa, "Two Party RSA Key Generation," CRYPTO 1999. *(M2
+  OLE-from-OT bit-decomposition.)*
+- **half-gate** — Zahur, Rosulek, Evans, "Two Halves Make a Whole: Reducing
+  Data Transfer in Garbled Circuits using Half Gates," EUROCRYPT 2015. *(M3.)*
+- **free-XOR** — Kolesnikov, Schneider, "Improved Garbled Circuit: Free XOR
+  Gates and Applications," ICALP 2008. *(M3.)*
+- **authenticated garbling (WRK)** — Wang, Ranellucci, Katz, "Authenticated
+  Garbling and Efficient Maliciously Secure Two-Party Computation," CCS 2017.
+  *(§14 malicious garbling backend; not yet in the connector.)*
+
+### §14 malicious-secure future — connector papers (with docIds)
+
+Cite here and **only** here (never on a v0 milestone).
+- **QuickSilver** — docId `1783051233072-cwhczx`. The stated §14 lineage: 1
+  field element/AND gate, IT-MACs `M = K + x·Δ` over GF(2^128), batched RLC
+  check. *(Post-close re-proof; commitment-to-ciphertext binding.)*
+- **Wolverine** — docId `1783060460386-1b6hqh`. Subfield-VOLE authenticated
+  triples; the scalable precursor. *(Post-close re-proof.)*
+- **AntMan** — docId `1783060440324-wvzqfz`. IT-PAC, sublinear communication;
+  the SIMD/large-circuit option for the re-proof.
+- **Batchman/Robin** — docId `1783060400655-a7vfuh`. Batched disjunctions;
+  cited because the per-record AES/GHASH re-proof re-executes one circuit
+  structure across records — exactly a batched disjunction.
+- **Ferret** — docId `1783060450360-xa54lv`. LPN-based correlated OT. Its
+  **LPN-COT core** is a **future bandwidth optimization** (§16), *not* a v0
+  primitive; its **near-free malicious COT check** is a §14 seam.
+
+### Still processing — do not cite until ingested
+
+Placeholder; ingestion pending, no docIds usable yet: `964.pdf`, `996.pdf`,
+`popets-2025-0028.pdf`.
